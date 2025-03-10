@@ -1,0 +1,30 @@
+
+services:
+  mmaudio-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./api:/app/api
+      - weights:/app/weights
+      - ext_weights:/app/ext_weights
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Increase timeout for synchronous processing
+      - UVICORN_TIMEOUT=3600
+      - TORCH_USE_INFERENCE_MODE=1
+    restart: unless-stopped
+
+# disks
+volumes:
+  weights:
+  ext_weights:
