@@ -102,7 +102,7 @@ To specify a model variant, use the `variant` parameter in your API request.
 
 Here is a picture of how to use the API with Postman:
 
-![Postman](postman.png)
+![Postman](img/postman.png)
 
 
 
