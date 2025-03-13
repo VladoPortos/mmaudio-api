@@ -5,11 +5,12 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+      - "8095:8000"
     volumes:
       - ./api:/app/api
       - weights:/app/weights
       - ext_weights:/app/ext_weights
+      - huggingface:/root/.cache/huggingface
     deploy:
       resources:
         reservations:
@@ -28,3 +29,4 @@ services:
 volumes:
   weights:
   ext_weights:
+  huggingface:

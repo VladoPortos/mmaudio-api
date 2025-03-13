@@ -2,6 +2,7 @@ import os
 import logging
 import torch
 import torchaudio
+import gc
 from pathlib import Path
 
 from mmaudio.eval_utils import (ModelConfig, all_model_cfg, generate, load_video, make_video,
@@ -13,9 +14,21 @@ from mmaudio.model.utils.features_utils import FeaturesUtils
 # Enable TF32 precision for better performance on NVIDIA GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# Enable benchmark mode for faster performance with fixed input sizes
+torch.backends.cudnn.benchmark = True
 
 logger = logging.getLogger(__name__)
 setup_eval_logging()
+
+# Helper function for memory cleanup
+def cleanup_gpu_memory():
+    """Clean up GPU memory and trigger garbage collection"""
+    if torch.cuda.is_available():
+        # Empty CUDA cache
+        torch.cuda.empty_cache()
+        # Force garbage collection
+        gc.collect()
+        logger.info(f"Memory after cleanup: {torch.cuda.max_memory_allocated() / (2**30):.2f} GB")
 
 @torch.inference_mode()
 def process_video(
@@ -53,6 +66,9 @@ def process_video(
         dict: Paths to generated files
     """
     try:
+        # Clean up GPU memory from previous runs
+        cleanup_gpu_memory()
+        
         logger.info(f"Processing video for task {task_id}")
         
         # Check if variant exists
@@ -78,17 +94,44 @@ def process_video(
         else:
             logger.warning('CUDA/MPS are not available, running on CPU')
         
-        dtype = torch.float32 if full_precision else torch.bfloat16
+        # Performance optimization: Use float16 for large models on CUDA (only for models, not solver)
+        is_large_model = 'large' in variant
+        dtype = torch.float32
+        if not full_precision and device == 'cuda':
+            dtype = torch.float16  # Use float16 instead of bfloat16 for better CUDA performance
+        elif not full_precision:
+            dtype = torch.bfloat16
+        
+        # Performance optimization: Reduce steps for large model 
+        # Stay with 'euler' mode which is more stable
+        inference_mode = 'euler'
+        original_steps = num_steps
+        if is_large_model and device == 'cuda':
+            # For large_44k_v2, we can reduce steps which significantly improves performance
+            if num_steps == 25 and variant == 'large_44k_v2':
+                logger.info("Optimizing: Reducing steps from 25 to 15 for large_44k_v2 model")
+                num_steps = 15
+        
+        logger.info(f"Using inference mode: {inference_mode} with {num_steps} steps (originally requested: {original_steps})")
         
         # Load model
         net: MMAudio = get_my_mmaudio(model.model_name).to(device, dtype).eval()
         net.load_weights(torch.load(model.model_path, map_location=device, weights_only=True))
         logger.info(f"Loaded weights from {model.model_path}")
         
+        # Performance optimization: Use torch.compile if PyTorch 2.0+
+        # Only try to compile the model, not anything related to ODE solving
+        if hasattr(torch, 'compile') and device == 'cuda':
+            try:
+                logger.info("Optimizing: Using torch.compile() for model")
+                net = torch.compile(net)
+            except Exception as e:
+                logger.warning(f"Failed to compile model: {str(e)}. Continuing with uncompiled model.")
+        
         # Setup for generation
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
-        fm = FlowMatching(min_sigma=0, inference_mode='euler', num_steps=num_steps)
+        fm = FlowMatching(min_sigma=0, inference_mode=inference_mode, num_steps=num_steps)
         
         feature_utils = FeaturesUtils(
             tod_vae_ckpt=model.vae_path,
@@ -121,19 +164,34 @@ def process_video(
         logger.info(f"Prompt: {prompt}")
         logger.info(f"Negative prompt: {negative_prompt}")
         
-        # Generate audio using the standard generate function
-        # We can use it directly now with inference_mode decorator
-        audios = generate(
-            clip_frames,
-            sync_frames, 
-            [prompt],
-            negative_text=[negative_prompt],
-            feature_utils=feature_utils,
-            net=net,
-            fm=fm,
-            rng=rng,
-            cfg_strength=cfg_strength
-        )
+        # Generate audio using the standard generate function with mixed precision if on CUDA
+        if device == 'cuda' and not full_precision:
+            logger.info("Optimizing: Using torch.amp.autocast for mixed precision")
+            with torch.amp.autocast('cuda'):
+                audios = generate(
+                    clip_frames,
+                    sync_frames, 
+                    [prompt],
+                    negative_text=[negative_prompt],
+                    feature_utils=feature_utils,
+                    net=net,
+                    fm=fm,
+                    rng=rng,
+                    cfg_strength=cfg_strength
+                )
+        else:
+            # We can use it directly now with inference_mode decorator
+            audios = generate(
+                clip_frames,
+                sync_frames, 
+                [prompt],
+                negative_text=[negative_prompt],
+                feature_utils=feature_utils,
+                net=net,
+                fm=fm,
+                rng=rng,
+                cfg_strength=cfg_strength
+            )
         
         audio = audios.float().cpu()[0]
         
@@ -151,6 +209,12 @@ def process_video(
         if torch.cuda.is_available():
             logger.info(f"Memory usage: {torch.cuda.max_memory_allocated() / (2**30):.2f} GB")
         
+        # Explicitly clean up tensors that might hold references
+        if device == 'cuda':
+            del audios, audio, net, feature_utils, fm, clip_frames, sync_frames
+            # Clean up GPU memory again
+            cleanup_gpu_memory()
+        
         # Return paths to generated files
         return {
             "audio_path": str(audio_save_path),
@@ -158,5 +222,8 @@ def process_video(
         }
     
     except Exception as e:
+        # Make sure to clean up even if there's an error
+        if torch.cuda.is_available():
+            cleanup_gpu_memory()
         logger.exception(f"Error processing video for task {task_id}: {str(e)}")
         raise
