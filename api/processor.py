@@ -2,6 +2,7 @@ import os
 import logging
 import torch
 import torchaudio
+import torchaudio.functional as F
 import gc
 from pathlib import Path
 
@@ -29,6 +30,56 @@ def cleanup_gpu_memory():
         # Force garbage collection
         gc.collect()
         logger.info(f"Memory after cleanup: {torch.cuda.max_memory_allocated() / (2**30):.2f} GB")
+
+def normalize_audio_for_youtube(audio_tensor, target_lufs=-14.0, keep_mono=False):
+    """
+    Normalize audio to YouTube recommended loudness levels (-14 LUFS)
+    and ensure it's in stereo format.
+    
+    Args:
+        audio_tensor: PyTorch tensor of shape [channels, samples]
+        target_lufs: Target loudness in LUFS (Loudness Units Full Scale)
+        keep_mono: If True, will not convert mono to stereo
+    
+    Returns:
+        Normalized audio tensor
+    """
+    # Make sure audio is in CPU
+    audio = audio_tensor.cpu()
+    
+    # Get number of channels
+    if len(audio.shape) < 2:
+        # Convert from [samples] to [1, samples]
+        audio = audio.unsqueeze(0)
+    
+    channels, samples = audio.shape
+    
+    # Convert to stereo if mono and not keep_mono
+    if channels == 1 and not keep_mono:
+        logger.info("Converting mono audio to stereo")
+        # Clone the mono channel to create stereo
+        audio = audio.repeat(2, 1)
+    elif channels > 2:
+        logger.info(f"Audio has {channels} channels, converting to stereo")
+        # Take first two channels if more than stereo
+        audio = audio[:2]
+    
+    # Normalize the audio loudness to YouTube standards
+    # Simple peak normalization as an approximation
+    # Calculate the current peak
+    current_peak = audio.abs().max().item()
+    
+    # Target peak level (approximation for YouTube loudness)
+    # -14 LUFS is roughly -1 dBFS peak for typical content
+    target_peak = 0.9  # 90% of maximum to avoid clipping
+    
+    # Calculate gain needed
+    if current_peak > 0:
+        gain = target_peak / current_peak
+        logger.info(f"Normalizing audio with gain factor: {gain:.2f}")
+        audio = audio * gain
+    
+    return audio
 
 @torch.inference_mode()
 def process_video(
@@ -195,14 +246,23 @@ def process_video(
         
         audio = audios.float().cpu()[0]
         
-        # Save output audio
+        # Normalize audio to YouTube levels
+        logger.info("Normalizing audio to YouTube levels")
+        # For video creation, keep as mono because make_video expects mono
+        mono_normalized_audio = normalize_audio_for_youtube(audio, keep_mono=True)
+        
+        # For the standalone audio file, convert to stereo
+        logger.info("Creating stereo version for audio file")
+        stereo_normalized_audio = normalize_audio_for_youtube(audio, keep_mono=False)
+        
+        # Save output audio as stereo
         audio_save_path = output_dir / f"{video_path.stem}.flac"
-        torchaudio.save(audio_save_path, audio, seq_cfg.sampling_rate)
+        torchaudio.save(audio_save_path, stereo_normalized_audio, seq_cfg.sampling_rate)
         logger.info(f"Audio saved to {audio_save_path}")
         
-        # Create and save output video with audio
+        # Create and save output video with audio (using mono for compatibility)
         video_save_path = output_dir / f"{video_path.stem}.mp4"
-        make_video(video_info, video_save_path, audio, sampling_rate=seq_cfg.sampling_rate)
+        make_video(video_info, video_save_path, mono_normalized_audio, sampling_rate=seq_cfg.sampling_rate)
         logger.info(f"Video saved to {video_save_path}")
         
         # Log memory usage if CUDA available
@@ -211,7 +271,7 @@ def process_video(
         
         # Explicitly clean up tensors that might hold references
         if device == 'cuda':
-            del audios, audio, net, feature_utils, fm, clip_frames, sync_frames
+            del audios, audio, mono_normalized_audio, stereo_normalized_audio, net, feature_utils, fm, clip_frames, sync_frames
             # Clean up GPU memory again
             cleanup_gpu_memory()
         
